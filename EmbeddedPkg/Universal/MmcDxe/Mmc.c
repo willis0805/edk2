@@ -26,8 +26,10 @@ EFI_BLOCK_IO_MEDIA  mMmcMediaTemplate = {
   FALSE,                             // WriteCaching
   512,                               // BlockSize
   4,                                 // IoAlign
-  0,                                 // Pad
-  0                                  // LastBlock
+  0,                                 // LastBlock
+  0,                                 // LowestAlignedLba
+  1,                                 // LogicalBlocksPerPhysicalBlock
+  0                                  // OptimalTransferLengthGranularity
 };
 
 //
@@ -373,11 +375,19 @@ CheckCardsCallback (
 
     if (MmcHostInstance->MmcHost->IsCardPresent (MmcHostInstance->MmcHost) == !MmcHostInstance->Initialized) {
       MmcHostInstance->State                       = MmcHwInitializationState;
-      MmcHostInstance->BlockIo.Media->MediaPresent = !MmcHostInstance->Initialized;
-      MmcHostInstance->Initialized                 = !MmcHostInstance->Initialized;
+      MmcHostInstance->BlockIo.Media->MediaPresent = FALSE;
+      // Latch the presence transition even if identification fails. Retrying
+      // every timer tick would stall boot on a fixed-media host without card
+      // detection. A removable host retries after removal and reinsertion.
+      MmcHostInstance->Initialized = !MmcHostInstance->Initialized;
 
-      if (MmcHostInstance->BlockIo.Media->MediaPresent) {
-        InitializeMmcDevice (MmcHostInstance);
+      if (MmcHostInstance->Initialized) {
+        Status = InitializeMmcDevice (MmcHostInstance);
+        MmcHostInstance->BlockIo.Media->MediaPresent = !EFI_ERROR (Status);
+        if (EFI_ERROR (Status)) {
+          MmcHostInstance->State = MmcHwInitializationState;
+          DEBUG ((DEBUG_ERROR, "MMC identification failed: %r\n", Status));
+        }
       }
 
       Status = gBS->ReinstallProtocolInterface (

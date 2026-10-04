@@ -58,10 +58,10 @@
 #define EMMC_CMD6_ARG_CMD_SET(x)  (((x) & 0x7) << 0)
 
 #define SWITCH_CMD_DATA_LENGTH   64
-#define SD_HIGH_SPEED_SUPPORTED  0x20000
+#define SD_HIGH_SPEED_SUPPORTED  BIT1
 #define SD_DEFAULT_SPEED         25000000
 #define SD_HIGH_SPEED            50000000
-#define SWITCH_CMD_SUCCESS_MASK  0x0f000000
+#define SWITCH_CMD_SUCCESS_MASK  0x0f
 
 #define SD_CARD_CAPACITY  0x00000002
 
@@ -336,7 +336,7 @@ typedef struct _MMC_HOST_INSTANCE {
   CARD_INFO                   CardInfo;
   EFI_MMC_HOST_PROTOCOL       *MmcHost;
 
-  BOOLEAN                     Initialized;
+  BOOLEAN                     Initialized; // Presence/probe-attempt latch; MediaPresent records success.
 } MMC_HOST_INSTANCE;
 
 #define MMC_HOST_INSTANCE_SIGNATURE  SIGNATURE_32('m', 'm', 'c', 'h')

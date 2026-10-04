@@ -33,6 +33,7 @@
   UefiLib
   UefiDriverEntryPoint
   BaseMemoryLib
+  TimerLib
 
 [Protocols]
   gEfiDiskIoProtocolGuid

@@ -7,6 +7,7 @@
 **/
 
 #include <Library/BaseMemoryLib.h>
+#include <Library/TimerLib.h>
 
 #include "Mmc.h"
 
@@ -114,7 +115,7 @@ MmcStopTransmission (
   // Normally only needed for streaming transfers or after error.
   Status = MmcHost->SendCommand (MmcHost, MMC_CMD12, 0);
   if (!EFI_ERROR (Status)) {
-    MmcHost->ReceiveResponse (MmcHost, MMC_RESPONSE_TYPE_R1b, Response);
+    Status = MmcHost->ReceiveResponse (MmcHost, MMC_RESPONSE_TYPE_R1b, Response);
   }
 
   return Status;
@@ -195,30 +196,38 @@ MmcTransferBlock (
     }
   }
 
-  // Command 13 - Read status and wait for programming to complete (return to tran)
-  Timeout     = MMCI0_TIMEOUT;
-  CmdArg      = MmcHostInstance->CardInfo.RCA << 16;
-  Response[0] = 0;
-  while (  !(Response[0] & MMC_R0_READY_FOR_DATA)
-        && (MMC_R0_CURRENTSTATE (Response) != MMC_R0_STATE_TRAN)
-        && Timeout--)
-  {
-    Status = MmcHost->SendCommand (MmcHost, MMC_CMD13, CmdArg);
-    if (!EFI_ERROR (Status)) {
-      MmcHost->ReceiveResponse (MmcHost, MMC_RESPONSE_TYPE_R1, Response);
-      if (Response[0] & MMC_R0_READY_FOR_DATA) {
-        break;  // Prevents delay once finished
-      }
+  // Stop a multi-block transfer before polling for the transfer state.
+  if (BufferSize > This->Media->BlockSize) {
+    Status = MmcStopTransmission (MmcHost);
+    if (EFI_ERROR (Status)) {
+      return Status;
     }
   }
 
-  if (BufferSize > This->Media->BlockSize) {
-    Status = MmcHost->SendCommand (MmcHost, MMC_CMD12, 0);
+  // Wait until the card is both ready for data and back in transfer state.
+  CmdArg = MmcHostInstance->CardInfo.RCA << 16;
+  for (Timeout = MMCI0_TIMEOUT; Timeout > 0; Timeout--) {
+    Status = MmcHost->SendCommand (MmcHost, MMC_CMD13, CmdArg);
     if (EFI_ERROR (Status)) {
-      DEBUG ((DEBUG_BLKIO, "%a(): Error and Status:%r\n", __func__, Status));
+      return Status;
     }
 
-    MmcHost->ReceiveResponse (MmcHost, MMC_RESPONSE_TYPE_R1b, Response);
+    Status = MmcHost->ReceiveResponse (MmcHost, MMC_RESPONSE_TYPE_R1, Response);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+
+    if (((Response[0] & MMC_R0_READY_FOR_DATA) != 0) &&
+        (MMC_R0_CURRENTSTATE (Response) == MMC_R0_STATE_TRAN))
+    {
+      break;
+    }
+
+    MicroSecondDelay (1000);
+  }
+
+  if (Timeout == 0) {
+    return EFI_TIMEOUT;
   }
 
   Status = MmcNotifyState (MmcHostInstance, MmcTransferState);
@@ -253,7 +262,7 @@ MmcIoBlocks (
   UINT32                 MaxBlock;
   UINTN                  RemainingBlock;
 
-  BlockCount      = 1;
+  MaxBlock        = 1;
   MmcHostInstance = MMC_HOST_INSTANCE_FROM_BLOCK_IO_THIS (This);
   ASSERT (MmcHostInstance != NULL);
   MmcHost = MmcHostInstance->MmcHost;
@@ -282,12 +291,15 @@ MmcIoBlocks (
     return EFI_BAD_BUFFER_SIZE;
   }
 
+  BlockCount = BufferSize / This->Media->BlockSize;
   if (MMC_HOST_HAS_ISMULTIBLOCK (MmcHost) && MmcHost->IsMultiBlock (MmcHost)) {
-    BlockCount = BufferSize / This->Media->BlockSize;
+    MaxBlock = 0xFFFF;
   }
 
   // All blocks must be within the device
-  if ((Lba + (BufferSize / This->Media->BlockSize)) > (This->Media->LastBlock + 1)) {
+  if ((Lba > This->Media->LastBlock) ||
+      ((BlockCount - 1) > (This->Media->LastBlock - Lba)))
+  {
     return EFI_INVALID_PARAMETER;
   }
 
@@ -300,8 +312,7 @@ MmcIoBlocks (
     return EFI_INVALID_PARAMETER;
   }
 
-  // Max block number in single cmd is 65535 blocks.
-  MaxBlock                     = 0xFFFF;
+  // Limit each command to the number of blocks supported by the host.
   RemainingBlock               = BlockCount;
   BytesRemainingToBeTransfered = BufferSize;
   while (BytesRemainingToBeTransfered > 0) {
@@ -311,21 +322,30 @@ MmcIoBlocks (
       BlockCount = MaxBlock;
     }
 
-    // Check if the Card is in Ready status
-    CmdArg      = MmcHostInstance->CardInfo.RCA << 16;
-    Response[0] = 0;
-    Timeout     = 20;
-    while (  (!(Response[0] & MMC_R0_READY_FOR_DATA))
-          && (MMC_R0_CURRENTSTATE (Response) != MMC_R0_STATE_TRAN)
-          && Timeout--)
-    {
+    // Check if the card is ready, without losing transport errors or allowing
+    // the retry counter to underflow on exhaustion.
+    CmdArg = MmcHostInstance->CardInfo.RCA << 16;
+    for (Timeout = 20; Timeout > 0; Timeout--) {
       Status = MmcHost->SendCommand (MmcHost, MMC_CMD13, CmdArg);
-      if (!EFI_ERROR (Status)) {
-        MmcHost->ReceiveResponse (MmcHost, MMC_RESPONSE_TYPE_R1, Response);
+      if (EFI_ERROR (Status)) {
+        return Status;
       }
+
+      Status = MmcHost->ReceiveResponse (MmcHost, MMC_RESPONSE_TYPE_R1, Response);
+      if (EFI_ERROR (Status)) {
+        return Status;
+      }
+
+      if (((Response[0] & MMC_R0_READY_FOR_DATA) != 0) &&
+          (MMC_R0_CURRENTSTATE (Response) == MMC_R0_STATE_TRAN))
+      {
+        break;
+      }
+
+      MicroSecondDelay (1000);
     }
 
-    if (0 == Timeout) {
+    if (Timeout == 0) {
       DEBUG ((DEBUG_ERROR, "The Card is busy\n"));
       return EFI_NOT_READY;
     }
@@ -356,6 +376,7 @@ MmcIoBlocks (
     Status = MmcTransferBlock (This, Cmd, Transfer, MediaId, Lba, ConsumeSize, Buffer);
     if (EFI_ERROR (Status)) {
       DEBUG ((DEBUG_ERROR, "%a(): Failed to transfer block and Status:%r\n", __func__, Status));
+      return Status;
     }
 
     RemainingBlock               -= BlockCount;

@@ -2,6 +2,7 @@
   Definition of the MMC Host Protocol
 
   Copyright (c) 2011-2014, ARM Limited. All rights reserved.
+  Copyright (c) 2023 StarFive, Technology Co., Ltd. All rights reserved.
 
   SPDX-License-Identifier: BSD-2-Clause-Patent
 
@@ -34,6 +35,10 @@ typedef UINT32 MMC_CMD;
 #define MMC_CMD_LONG_RESPONSE    (1 << 17)
 #define MMC_CMD_NO_CRC_RESPONSE  (1 << 18)
 
+// SD memory commands with a data phase, distinct from MMC commands of the same
+// index. Only send this flag to hosts advertising the SD command revision.
+#define SD_CMD  BIT31
+
 #define MMC_INDX(Index)       ((Index) & 0xFFFF)
 #define MMC_GET_INDX(MmcCmd)  ((MmcCmd) & 0xFFFF)
 
@@ -43,6 +48,7 @@ typedef UINT32 MMC_CMD;
 #define MMC_CMD3    (MMC_INDX(3) | MMC_CMD_WAIT_RESPONSE)
 #define MMC_CMD5    (MMC_INDX(5) | MMC_CMD_WAIT_RESPONSE | MMC_CMD_NO_CRC_RESPONSE)
 #define MMC_CMD6    (MMC_INDX(6) | MMC_CMD_WAIT_RESPONSE)
+#define SD_CMD6     (MMC_CMD6 | SD_CMD)
 #define MMC_CMD7    (MMC_INDX(7) | MMC_CMD_WAIT_RESPONSE)
 #define MMC_CMD8    (MMC_INDX(8) | MMC_CMD_WAIT_RESPONSE)
 #define MMC_CMD9    (MMC_INDX(9) | MMC_CMD_WAIT_RESPONSE | MMC_CMD_LONG_RESPONSE)
@@ -169,6 +175,12 @@ struct _EFI_MMC_HOST_PROTOCOL {
 };
 
 #define MMC_HOST_PROTOCOL_REVISION  0x00010002      // 1.2
+
+// Revision 1.3 opts in to SD_CMD6. Keep the default at 1.2 so existing hosts
+// that compare complete command values continue receiving MMC_CMD6.
+#define MMC_HOST_PROTOCOL_REVISION_SD_CMD  0x00010003
+
+#define MMC_HOST_HAS_SD_CMD(Host)  ((Host)->Revision >= MMC_HOST_PROTOCOL_REVISION_SD_CMD)
 
 #define MMC_HOST_HAS_SETIOS(Host)        (Host->Revision >= MMC_HOST_PROTOCOL_REVISION &&\
                                        Host->SetIos != NULL)

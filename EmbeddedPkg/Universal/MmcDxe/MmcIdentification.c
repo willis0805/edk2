@@ -1,6 +1,7 @@
 /** @file
 *
 *  Copyright (c) 2011-2015, ARM Limited. All rights reserved.
+*  Copyright (c) 2023 StarFive, Technology Co., Ltd. All rights reserved.
 *
 *  SPDX-License-Identifier: BSD-2-Clause-Patent
 *
@@ -61,6 +62,62 @@ typedef enum _EMMC_DEVICE_STATE {
 
 UINT16  mEmmcRcaCount = 0;
 
+// Bound the complete identification command sequence, not just each command.
+// Hosts must still bound their individual calls; one in-flight call may exceed
+// this budget. Timer properties support both counter directions and rollover.
+#define MMC_IDENTIFICATION_TIMEOUT_NS  5000000000ULL
+
+typedef struct {
+  UINT64    InitialCount;
+  UINT64    CounterStart;
+  UINT64    CounterEnd;
+} MMC_IDENTIFICATION_TIMER;
+
+STATIC
+BOOLEAN
+MmcIdentificationTimedOut (
+  IN CONST MMC_IDENTIFICATION_TIMER  *Timer
+  )
+{
+  UINT64  Current;
+  UINT64  Elapsed;
+
+  Current = GetPerformanceCounter ();
+  if (Timer->CounterStart > Timer->CounterEnd) {
+    if (Current <= Timer->InitialCount) {
+      Elapsed = Timer->InitialCount - Current;
+    } else {
+      Elapsed = (Timer->InitialCount - Timer->CounterEnd) +
+                (Timer->CounterStart - Current) + 1;
+    }
+  } else {
+    if (Current >= Timer->InitialCount) {
+      Elapsed = Current - Timer->InitialCount;
+    } else {
+      Elapsed = (Timer->CounterEnd - Timer->InitialCount) +
+                (Current - Timer->CounterStart) + 1;
+    }
+  }
+
+  return GetTimeInNanoSecond (Elapsed) >= MMC_IDENTIFICATION_TIMEOUT_NS;
+}
+
+STATIC
+EFI_STATUS
+MmcSendIdentificationCommand (
+  IN CONST MMC_IDENTIFICATION_TIMER  *Timer,
+  IN EFI_MMC_HOST_PROTOCOL            *Host,
+  IN MMC_CMD                          Command,
+  IN UINT32                           Argument
+  )
+{
+  if (MmcIdentificationTimedOut (Timer)) {
+    return EFI_TIMEOUT;
+  }
+
+  return Host->SendCommand (Host, Command, Argument);
+}
+
 STATIC
 EFI_STATUS
 EFIAPI
@@ -113,6 +170,7 @@ EmmcSetEXTCSD (
   EMMC_DEVICE_STATE      State;
   EFI_STATUS             Status;
   UINT32                 Argument;
+  UINTN                  Retry;
 
   Host     = MmcHostInstance->MmcHost;
   Argument = EMMC_CMD6_ARG_ACCESS (3) | EMMC_CMD6_ARG_INDEX (ExtCmdIndex) |
@@ -124,15 +182,21 @@ EmmcSetEXTCSD (
   }
 
   // Make sure device exiting prog mode
-  do {
+  for (Retry = 0; Retry < MAX_RETRY_COUNT; Retry++) {
     Status = EmmcGetDeviceState (MmcHostInstance, &State);
     if (EFI_ERROR (Status)) {
       DEBUG ((DEBUG_ERROR, "EmmcSetEXTCSD(): Failed to get device state, Status=%r.\n", Status));
       return Status;
     }
-  } while (State == EMMC_PRG_STATE);
 
-  return EFI_SUCCESS;
+    if (State != EMMC_PRG_STATE) {
+      return EFI_SUCCESS;
+    }
+
+    MicroSecondDelay (1000);
+  }
+
+  return EFI_TIMEOUT;
 }
 
 STATIC
@@ -148,6 +212,7 @@ EmmcIdentificationMode (
   EFI_STATUS             Status;
   EMMC_DEVICE_STATE      State;
   UINT32                 RCA;
+  UINTN                  Retry;
 
   Host  = MmcHostInstance->MmcHost;
   Media = MmcHostInstance->BlockIo.Media;
@@ -227,13 +292,24 @@ EmmcIdentificationMode (
   }
 
   // Make sure device exiting data mode
-  do {
+  for (Retry = 0; Retry < MAX_RETRY_COUNT; Retry++) {
     Status = EmmcGetDeviceState (MmcHostInstance, &State);
     if (EFI_ERROR (Status)) {
       DEBUG ((DEBUG_ERROR, "EmmcIdentificationMode(): Failed to get device state, Status=%r.\n", Status));
       goto FreePageExit;
     }
-  } while (State == EMMC_DATA_STATE);
+
+    if (State != EMMC_DATA_STATE) {
+      break;
+    }
+
+    MicroSecondDelay (1000);
+  }
+
+  if (Retry == MAX_RETRY_COUNT) {
+    Status = EFI_TIMEOUT;
+    goto FreePageExit;
+  }
 
   // Set up media
   Media->BlockSize                     = EMMC_CARD_SIZE; // 512-byte support is mandatory for eMMC cards
@@ -350,6 +426,9 @@ InitializeSdMmcDevice (
   UINT32                 Response[4];
   UINT32                 Buffer[128];
   UINT32                 Speed;
+  UINT32                 BusWidth;
+  MMC_CMD                SwitchCmd;
+  UINT8                  *SwitchStatus;
   UINT32                 BlockSize;
   UINT32                 CardSize;
   UINTN                  NumBlocks;
@@ -358,8 +437,11 @@ InitializeSdMmcDevice (
   EFI_STATUS             Status;
   EFI_MMC_HOST_PROTOCOL  *MmcHost;
 
-  Speed   = SD_DEFAULT_SPEED;
-  MmcHost = MmcHostInstance->MmcHost;
+  Speed        = SD_DEFAULT_SPEED;
+  BusWidth     = 1;
+  MmcHost      = MmcHostInstance->MmcHost;
+  SwitchCmd    = MMC_HOST_HAS_SD_CMD (MmcHost) ? SD_CMD6 : MMC_CMD6;
+  SwitchStatus = (UINT8 *)Buffer;
 
   // Send a command to get Card specific data
   CmdArg = MmcHostInstance->CardInfo.RCA << 16;
@@ -471,7 +553,7 @@ InitializeSdMmcDevice (
   if (CccSwitch) {
     /* SD Switch, Mode:0, Group:0, Value:0 */
     CmdArg = CreateSwitchCmdArgument (0, 0, 0);
-    Status = MmcHost->SendCommand (MmcHost, MMC_CMD6, CmdArg);
+    Status = MmcHost->SendCommand (MmcHost, SwitchCmd, CmdArg);
     if (EFI_ERROR (Status)) {
       DEBUG ((DEBUG_ERROR, "%a (MMC_CMD6): Error and Status = %r\n", __func__, Status));
       return Status;
@@ -483,14 +565,14 @@ InitializeSdMmcDevice (
       }
     }
 
-    if (!(Buffer[3] & SD_HIGH_SPEED_SUPPORTED)) {
+    // The switch status is transmitted most-significant byte first. Group 1
+    // support occupies bits [415:400], with high speed at bit 401 (byte 13).
+    if ((SwitchStatus[13] & SD_HIGH_SPEED_SUPPORTED) == 0) {
       DEBUG ((DEBUG_INFO, "%a : High Speed not supported by Card\n", __func__));
     } else {
-      Speed = SD_HIGH_SPEED;
-
       /* SD Switch, Mode:1, Group:0, Value:1 */
       CmdArg = CreateSwitchCmdArgument (1, 0, 1);
-      Status = MmcHost->SendCommand (MmcHost, MMC_CMD6, CmdArg);
+      Status = MmcHost->SendCommand (MmcHost, SwitchCmd, CmdArg);
       if (EFI_ERROR (Status)) {
         DEBUG ((DEBUG_ERROR, "%a (MMC_CMD6): Error and Status = %r\n", __func__, Status));
         return Status;
@@ -501,10 +583,13 @@ InitializeSdMmcDevice (
           return Status;
         }
 
-        if ((Buffer[4] & SWITCH_CMD_SUCCESS_MASK) != 0x01000000) {
+        // Group 1 selection is bits [379:376], the low nibble of byte 16.
+        if ((SwitchStatus[16] & SWITCH_CMD_SUCCESS_MASK) != 1) {
           DEBUG ((DEBUG_ERROR, "Problem switching SD card into high-speed mode\n"));
-          return Status;
+          return EFI_DEVICE_ERROR;
         }
+
+        Speed = SD_HIGH_SPEED;
       }
     }
   }
@@ -523,10 +608,12 @@ InitializeSdMmcDevice (
       DEBUG ((DEBUG_ERROR, "%a (MMC_CMD6): Error and Status = %r\n", __func__, Status));
       return Status;
     }
+
+    BusWidth = BUSWIDTH_4;
   }
 
   if (MMC_HOST_HAS_SETIOS (MmcHost)) {
-    Status = MmcHost->SetIos (MmcHost, Speed, BUSWIDTH_4, EMMCBACKWARD);
+    Status = MmcHost->SetIos (MmcHost, Speed, BusWidth, EMMCBACKWARD);
     if (EFI_ERROR (Status)) {
       DEBUG ((DEBUG_ERROR, "%a (SetIos): Error and Status = %r\n", __func__, Status));
       return Status;
@@ -550,6 +637,7 @@ MmcIdentificationMode (
   BOOLEAN                IsHCS;
   EFI_MMC_HOST_PROTOCOL  *MmcHost;
   OCR_RESPONSE           OcrResponse;
+  MMC_IDENTIFICATION_TIMER  Timer;
 
   MmcHost = MmcHostInstance->MmcHost;
   CmdArg  = 0;
@@ -558,6 +646,9 @@ MmcIdentificationMode (
   if (MmcHost == NULL) {
     return EFI_INVALID_PARAMETER;
   }
+
+  GetPerformanceCounterProperties (&Timer.CounterStart, &Timer.CounterEnd);
+  Timer.InitialCount = GetPerformanceCounter ();
 
   // We can get into this function if we restart the identification mode
   if (MmcHostInstance->State == MmcHwInitializationState) {
@@ -569,7 +660,7 @@ MmcIdentificationMode (
     }
   }
 
-  Status = MmcHost->SendCommand (MmcHost, MMC_CMD0, 0);
+  Status = MmcSendIdentificationCommand (&Timer, MmcHost, MMC_CMD0, 0);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "MmcIdentificationMode(MMC_CMD0): Error, Status=%r.\n", Status));
     return Status;
@@ -585,7 +676,7 @@ MmcIdentificationMode (
   // This command only valid for MMC and eMMC
   Timeout = MAX_RETRY_COUNT;
   do {
-    Status = MmcHost->SendCommand (MmcHost, MMC_CMD1, EMMC_CMD1_CAPACITY_GREATER_THAN_2GB);
+    Status = MmcSendIdentificationCommand (&Timer, MmcHost, MMC_CMD1, EMMC_CMD1_CAPACITY_GREATER_THAN_2GB);
     if (EFI_ERROR (Status)) {
       break;
     }
@@ -596,6 +687,9 @@ MmcIdentificationMode (
       return Status;
     }
 
+    if (!OcrResponse.Ocr.PowerUp) {
+      MicroSecondDelay (1000);
+    }
     Timeout--;
   } while (!OcrResponse.Ocr.PowerUp && (Timeout > 0));
 
@@ -621,7 +715,7 @@ MmcIdentificationMode (
   }
 
   // Are we using SDIO ?
-  Status = MmcHost->SendCommand (MmcHost, MMC_CMD5, 0);
+  Status = MmcSendIdentificationCommand (&Timer, MmcHost, MMC_CMD5, 0);
   if (Status == EFI_SUCCESS) {
     DEBUG ((DEBUG_ERROR, "MmcIdentificationMode(MMC_CMD5): Error - SDIO not supported, Status=%r.\n", Status));
     return EFI_UNSUPPORTED;
@@ -629,7 +723,7 @@ MmcIdentificationMode (
 
   // Check which kind of card we are using. Ver2.00 or later SD Memory Card (PL180 is SD v1.1)
   CmdArg = (0x0UL << 12 | BIT8 | 0xCEUL << 0);
-  Status = MmcHost->SendCommand (MmcHost, MMC_CMD8, CmdArg);
+  Status = MmcSendIdentificationCommand (&Timer, MmcHost, MMC_CMD8, CmdArg);
   if (Status == EFI_SUCCESS) {
     DEBUG ((DEBUG_ERROR, "Card is SD2.0 => Supports high capacity\n"));
     IsHCS  = TRUE;
@@ -652,8 +746,12 @@ MmcIdentificationMode (
   // We need to wait for the MMC or SD card is ready => (gCardInfo.OCRData.PowerUp == 1)
   Timeout = MAX_RETRY_COUNT;
   while (Timeout > 0) {
+    if (MmcIdentificationTimedOut (&Timer)) {
+      return EFI_TIMEOUT;
+    }
+
     // SD Card or MMC Card ? CMD55 indicates to the card that the next command is an application specific command
-    Status = MmcHost->SendCommand (MmcHost, MMC_CMD55, 0);
+    Status = MmcSendIdentificationCommand (&Timer, MmcHost, MMC_CMD55, 0);
     if (Status == EFI_SUCCESS) {
       DEBUG ((DEBUG_INFO, "Card should be SD\n"));
       if (IsHCS) {
@@ -668,7 +766,7 @@ MmcIdentificationMode (
         CmdArg |= BIT30;
       }
 
-      Status = MmcHost->SendCommand (MmcHost, MMC_ACMD41, CmdArg);
+      Status = MmcSendIdentificationCommand (&Timer, MmcHost, MMC_ACMD41, CmdArg);
       if (!EFI_ERROR (Status)) {
         Status = MmcHost->ReceiveResponse (MmcHost, MMC_RESPONSE_TYPE_OCR, Response);
         if (EFI_ERROR (Status)) {
@@ -682,7 +780,7 @@ MmcIdentificationMode (
       DEBUG ((DEBUG_INFO, "Card should be MMC\n"));
       MmcHostInstance->CardInfo.CardType = MMC_CARD;
 
-      Status = MmcHost->SendCommand (MmcHost, MMC_CMD1, 0x800000);
+      Status = MmcSendIdentificationCommand (&Timer, MmcHost, MMC_CMD1, 0x800000);
       if (!EFI_ERROR (Status)) {
         Status = MmcHost->ReceiveResponse (MmcHost, MMC_RESPONSE_TYPE_OCR, Response);
         if (EFI_ERROR (Status)) {
@@ -696,7 +794,7 @@ MmcIdentificationMode (
 
     if (!EFI_ERROR (Status)) {
       if (!MmcHostInstance->CardInfo.OCRData.PowerUp) {
-        gBS->Stall (1);
+        MicroSecondDelay (1000);
         Timeout--;
       } else {
         if ((MmcHostInstance->CardInfo.CardType == SD_CARD_2) && (MmcHostInstance->CardInfo.OCRData.AccessMode & BIT1)) {
@@ -707,7 +805,7 @@ MmcIdentificationMode (
         break;  // The MMC/SD card is ready. Continue the Identification Mode
       }
     } else {
-      gBS->Stall (1);
+      MicroSecondDelay (1000);
       Timeout--;
     }
   }
@@ -725,7 +823,7 @@ MmcIdentificationMode (
     return Status;
   }
 
-  Status = MmcHost->SendCommand (MmcHost, MMC_CMD2, 0);
+  Status = MmcSendIdentificationCommand (&Timer, MmcHost, MMC_CMD2, 0);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "MmcIdentificationMode(MMC_CMD2): Error\n"));
     return Status;
@@ -751,7 +849,7 @@ MmcIdentificationMode (
   // The status returned for this CMD3 will be 2 - identification
   //
   CmdArg = 1;
-  Status = MmcHost->SendCommand (MmcHost, MMC_CMD3, CmdArg);
+  Status = MmcSendIdentificationCommand (&Timer, MmcHost, MMC_CMD3, CmdArg);
   if (EFI_ERROR (Status)) {
     DEBUG ((DEBUG_ERROR, "MmcIdentificationMode(MMC_CMD3): Error\n"));
     return Status;
